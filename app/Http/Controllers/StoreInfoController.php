@@ -64,7 +64,7 @@ class StoreInfoController extends Controller
             'twitter' => 'nullable|url',
             'instagram' => 'nullable|url',
             'youtube' => 'nullable|url',
-            'whatsapp' => 'nullable|string|max:20',
+            'whatsapp' => 'nullable|string',
             'seo_description' => 'nullable|string',
             'seo_keywords' => 'nullable|string',
             'color' => 'nullable|string',
@@ -99,55 +99,59 @@ class StoreInfoController extends Controller
         return $token == env('ACCESS_DASHBOARD_TOKEN') ? true : false;
     }
 
-    public function update(Request $request)
-    {
-        $this->checkAdmin();
+public function update(Request $request)
+{
+    $this->checkAdmin();
 
-        $info = StoreInfo::first();
+    // 1. محاولة جلب السجل الأول أو إنشاء كائن جديد إذا لم يوجد
+    $info = StoreInfo::first() ?: new StoreInfo();
 
-        $validated = $request->validate([
-            'name' => 'sometimes|string|max:255',
-            'description' => 'nullable|string',
-            'logo' => 'nullable|image|mimes:jpeg,png,jpg,gif,svg|max:2048',
-            'footer_text' => 'nullable|string',
-            'phone' => 'nullable|string|max:20',
-            'email' => 'nullable|email',
-            'address' => 'nullable|string',
-            'facebook' => 'nullable|url',
-            'twitter' => 'nullable|url',
-            'instagram' => 'nullable|url',
-            'youtube' => 'nullable|url',
-            'whatsapp' => 'nullable|string|max:20',
-            'seo_description' => 'nullable|string',
-            'seo_keywords' => 'nullable|string',
-            'color' => 'nullable|string',
-            'zip' => 'nullable|string',
+    // 2. التحقق من صحة البيانات (Validation)
+    $validated = $request->validate([
+        'name' => 'sometimes|string|max:255',
+        'description' => 'nullable|string',
+        'logo' => 'nullable|image|mimes:jpeg,png,jpg,gif,svg|max:2048',
+        'footer_text' => 'nullable|string',
+        'phone' => 'nullable|string|max:20',
+        'email' => 'nullable|email',
+        'address' => 'nullable|string',
+        'facebook' => 'nullable|url',
+        'twitter' => 'nullable|url',
+        'instagram' => 'nullable|url',
+        'youtube' => 'nullable|url',
+        'whatsapp' => 'nullable|string|max:20',
+        'seo_description' => 'nullable|string',
+        'seo_keywords' => 'nullable|string',
+      'color' => 'nullable|string',
+        'zip' => 'nullable|string',
+    ]);
 
-
-        ]);
-
-        // إذا رفع المستخدم شعار جديد، احذف القديم وأرفع الجديد
-        if ($request->hasFile('logo')) {
-            // حذف الصورة القديمة لو موجودة
-            if ($info->logo && Storage::disk('public')->exists($info->logo)) {
-                Storage::disk('public')->delete($info->logo);
-            }
-
-            $path = $request->file('logo')->store('store_logos', 'public');
-            $validated['logo'] = $path;
+    // 3. معالجة الشعار (إذا تم رفع شعار جديد)
+    if ($request->hasFile('logo')) {
+        // حذف الصورة القديمة فقط إذا كان السجل موجوداً أصلاً وله صورة
+        if ($info->exists && $info->logo && Storage::disk('public')->exists($info->logo)) {
+            Storage::disk('public')->delete($info->logo);
         }
 
-        $info->update($validated);
-        $info->logo_url = $info->logo ? ('/storage/' . $info->logo) : null;
-
-        Cache::forget('store_infos');
-        Cache::forget('store_info_' . $info->id);
-
-        return response()->json([
-            'message' => 'Store info updated successfully',
-            'store_info' => $info,
-        ]);
+        $path = $request->file('logo')->store('store_logos', 'public');
+        $validated['logo'] = $path;
     }
+
+    // 4. الحفظ: سيقوم بعمل Update إذا كان موجوداً، أو Create إذا كان جديداً
+    $info->fill($validated);
+    $info->save();
+
+    // 5. تجهيز رابط الصورة والعناية بالكاش
+    $info->logo_url = $info->logo ? ('/storage/' . $info->logo) : null;
+
+    Cache::forget('store_infos');
+    Cache::forget('store_info_' . $info->id);
+
+    return response()->json([
+        'message' => $info->wasRecentlyCreated ? 'تم إنشاء بيانات المتجر بنجاح' : 'تم تحديث بيانات المتجر بنجاح',
+        'store_info' => $info,
+    ]);
+}
 
     public function destroy($id)
     {
