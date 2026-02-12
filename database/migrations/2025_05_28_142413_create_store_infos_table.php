@@ -34,7 +34,11 @@ return new class extends Migration
             $table->string('city')->nullable();
             $table->string('street')->nullable();
             $table->string('zip')->nullable();
-
+            $table->string('store_status')->nullable();
+            $table->string('tax_number')->nullable();
+            $table->string('start_subscription_date')->nullable();
+            $table->string('subscription_duration')->nullable(); // لإستيعاب قيمة annual أو monthly
+            $table->integer('location_id')->nullable(); // لأن الكود يحاول إرسال قيمة لهذا الحقل
             $table->timestamps();
         });
     }
