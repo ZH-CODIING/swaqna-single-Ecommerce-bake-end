@@ -24,6 +24,7 @@ use Illuminate\Support\Str;
 use App\Services\Payments\PaymentGatewayFactory;
 use App\Services\Shipping\GeneralShippingClass;
 use App\Services\Shipping\RedBoxShippingService;
+use Illuminate\Support\Facades\Http;
 
 class OrderController extends Controller
 {
@@ -127,8 +128,10 @@ class OrderController extends Controller
             $order->status = 'shippment_created';
             $order->save();
             $this->DecreaseOrderItems($order->items);
+            $order->load(['items.product', 'shippment']);
             return response()->json([
                 'message' => 'تم إنشاء الطلب بنجاح',
+               'shippment' => $order->shippment,
                 'order'  => $order
             ]);
         }
@@ -245,15 +248,18 @@ class OrderController extends Controller
 
         $orders = Cache::remember('user_orders_' . $userId, env('DEFAULT_CACHE_VALUE'), function () use ($user) {
             return $user->orders()
-                ->with('items.product', 'coupon', 'ShippingInfo', 'user')
+                ->with('shippment','items.product', 'coupon', 'ShippingInfo', 'user')
                 ->latest()
                 ->get();
         });
+$orderShippment=order_shipment::latest()->get();
 
         return response()->json([
+        
             'orders' => $orders,
         ]);
     }
+    
     public function AdminOrders(request $request)
     {
 
@@ -270,9 +276,11 @@ class OrderController extends Controller
             $query->where('status', $request->status);
         }
 
-        $orders =  $query->with('items.product:id,name,img,price', 'user')->latest()->paginate(15);
+        $orders =  $query->with('shippment','items.product:id,name,img,price', 'user')->latest()->paginate(15);
 
+$orderShippment=order_shipment::latest()->get();
         return response()->json([
+     
             'orders' => $orders,
         ]);
     }
@@ -286,74 +294,130 @@ class OrderController extends Controller
     }
 
 
-    public function update(Request $request, $id)
-    {
-        $user = Auth::user();
-        if ($user->role !== 'admin') {
-            return response()->json(['message' => 'غير مصرح'], 403);
+public function update(Request $request, $id)
+{
+    $user = Auth::user();
+    if ($user->role !== 'admin') {
+        return response()->json(['message' => 'غير مصرح'], 403);
+    }
+
+    $request->validate([
+        'address' => 'nullable|string',
+        'status' => 'nullable|in:pending,processing,shipped,delivered,canceled',
+        'products' => 'nullable|array|min:1',
+        'products.*.product_id' => 'required_with:products|exists:products,id',
+        'products.*.quantity' => 'required_with:products|integer|min:1',
+    ]);
+
+    // جلب الطلب مع الشحنة والعناصر
+    $order = Order::with(['items', 'shippment'])->findOrFail($id);
+
+    // --- منطق الإلغاء الجديد ---
+    if ($request->filled('status') && $request->status === 'canceled' && $order->status !== 'canceled') {
+        // 1. إرجاع الكميات للمخزن
+        $this->increaseOrderItems($order->items);
+
+        // 2. إلغاء شحنة Fastlo إذا كانت موجودة
+        if ($order->shippment && $order->shippment->shipping_gateway === 'fastlo') {
+            $this->cancelFastloShipment($order->shippment->tracking_number);
+        }
+    }
+    // -------------------------
+
+    if ($request->filled('address')) {
+        $order->address = $request->address;
+    }
+    
+    if ($request->filled('status')) {
+        $order->status = $request->status;
+    }
+
+    if ($request->filled('products')) {
+        $order->items()->delete();
+        $totalPrice = 0;
+        foreach ($request->products as $item) {
+            $product = Product::findOrFail($item['product_id']);
+            $totalPrice += $product->price * $item['quantity'];
+
+            OrderItem::create([
+                'order_id' => $order->id,
+                'product_id' => $product->id,
+                'quantity' => $item['quantity'],
+                'price' => $product->price,
+                'name'  => $product->name, 
+            ]);
         }
 
-        $request->validate([
-            'address' => 'nullable|string',
-            'status' => 'nullable|in:pending,processing,shipped,delivered,canceled',
-            'products' => 'nullable|array|min:1',
-            'products.*.product_id' => 'required_with:products|exists:products,id',
-            'products.*.quantity' => 'required_with:products|integer|min:1',
-        ]);
+        $order->total_price = $totalPrice;
+        $order->discount_amount = 0;
+        $order->discount_coupon_id = null;
+    }
 
-        $order = Order::with('items')->findOrFail($id);
+    $order->save();
 
-        if ($request->filled('address')) {
-            $order->address = $request->address;
-        }
-        if ($request->filled('status')) {
-            $order->status = $request->status;
-        }
-        if ($request->filled('products')) {
-            $order->items()->delete();
-            $totalPrice = 0;
-            foreach ($request->products as $item) {
-                $product = Product::findOrFail($item['product_id']);
-                $totalPrice += $product->price * $item['quantity'];
+    return response()->json([
+        'message' => 'تم تعديل الطلب بنجاح',
+        'order' => $order->load('items.product', 'coupon'),
+    ]);
+}
 
-                OrderItem::create([
-                    'order_id' => $order->id,
-                    'product_id' => $product->id,
-                    'quantity' => $item['quantity'],
-                    'price' => $product->price,
+public function UpdateStatus(Request $request, $order_id)
+{
+    $request->validate([
+        'status' => 'required|in:pending,completed,canceled,returned,failed,shippment_created',
+    ]);
+
+    $order = Order::with(['shippment', 'items'])->findOrFail($order_id);
+
+    // لو عايزين نلغي الطلب
+    if ($request->status === 'canceled' && $order->status !== 'canceled') {
+
+        // 1️⃣ رجع المخزون
+        $this->increaseOrderItems($order->items);
+
+        // 2️⃣ لو فيه شحنة Fastlo ولسه متلغتش
+        if (
+            $order->shippment &&
+            $order->shippment->shipping_gateway === 'fastlo' &&
+            $order->shippment->status !== 'canceled'
+        ) {
+
+            $isCanceled = $this->cancelFastloShipment(
+                $order->shippment->tracking_number
+            );
+
+            if ($isCanceled) {
+
+                $order->shippment->update([
+                    'status' => 'canceled'
                 ]);
+
+                \Log::info("Shipment canceled locally and on Fastlo for order {$order->id}");
+
+            } else {
+
+                \Log::error("Fastlo cancellation failed for order {$order->id}");
+
+                return response()->json([
+                    'message' => 'تم إلغاء الطلب لكن فشل إلغاء الشحنة في Fastlo'
+                ], 500);
             }
-
-
-            $order->total_price = $totalPrice;
-            $order->discount_amount = 0;
-            $order->discount_coupon_id = null;
         }
-
-        $order->save();
-
-        return response()->json([
-            'message' => 'تم تعديل الطلب بنجاح',
-            'order' => $order->load('items.product', 'coupon'),
-        ]);
     }
 
-    public function UpdateStatus(request $request, $order_id)
-    {
+    $order->update([
+        'status' => $request->status
+    ]);
 
-        $request->validate([
-            'status' => 'required|in:pending,completed,canceled,returned,failed,shippment_created',
-        ]);
-        $order = Order::findOrFail($order_id);
-        $order->update(['status' => $request->status]);
-        Cache::forget('user_orders_' . $order_id);
-        Cache::forget('user_orders_' . $order->user_id);
+    // تنظيف الكاش
+    Cache::forget('user_orders_' . $order->user_id);
 
-        return response()->json([
-            'message' => 'تم تعديل حالة الطلب بنجاح',
-            'order' => $order,
-        ]);
-    }
+    return response()->json([
+        'message' => 'تم تعديل حالة الطلب وإلغاء الشحنة بنجاح',
+        'order' => $order->load('shippment')
+    ]);
+}
+
 
     protected function checkAdmin()
     {
@@ -363,6 +427,64 @@ class OrderController extends Controller
             abort(403, 'Unauthorized: Admins only');
         }
     }
+
+/**
+ * استدعاء API شركة Fastlo لإلغاء الشحنة
+ */
+protected function cancelFastloShipment($trackingNumber)
+{
+    try {
+
+        $response = Http::withHeaders([
+            'fastlo-api-key' => env('FASTLO_API_KEY'),
+            'Accept'         => 'application/json',
+            'Content-Type'   => 'application/json',
+        ])->timeout(20)
+          ->post('https://fastlo.com/api/v1/cancel_shipment', [
+                'request' => [
+                    'tracknumber' => (string) $trackingNumber
+                ]
+          ]);
+
+        if (!$response->successful()) {
+            \Log::error("Fastlo HTTP Error: " . $response->body());
+            return false;
+        }
+
+        $data = $response->json();
+
+        if (
+            isset($data['status_code']) &&
+            $data['status_code'] == 200 &&
+            isset($data['output']['canceled_status']) &&
+            $data['output']['canceled_status'] == 1
+        ) {
+            \Log::info("Fastlo shipment canceled: {$trackingNumber}");
+            return true;
+        }
+
+        \Log::error("Fastlo Cancel Failed Response: " . json_encode($data));
+        return false;
+
+    } catch (\Exception $e) {
+        \Log::error("Fastlo Cancel Exception: " . $e->getMessage());
+        return false;
+    }
+}
+
+
+/**
+ * زيادة كمية المنتجات في المخزن
+ */
+protected function increaseOrderItems($items)
+{
+    foreach ($items as $item) {
+        $product = Product::find($item->product_id);
+        if ($product) {
+            $product->increment('quantity', $item->quantity);
+        }
+    }
+}
 
     public function GetLastOrder()
     {
